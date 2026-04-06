@@ -17,13 +17,13 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(json)
 
 # Create the executable
-add_executable(Ozu main.cpp
-                   tensor.cpp
-                   ops.cpp
-                   model.cpp
-                   models/llama.cpp
-                   tokenizer.cpp
-                   utils.cpp)
+add_executable(Ozu src/main.cpp
+                   src/tensor.cpp
+                   src/ops.cpp
+                   src/model.cpp
+                   src/models/llama.cpp
+                   src/tokenizer.cpp
+                   src/utils.cpp)
 
 # Link the JSON library to the executable
 target_link_libraries(Ozu PRIVATE nlohmann_json::nlohmann_json)
