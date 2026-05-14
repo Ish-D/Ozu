@@ -7,16 +7,13 @@ Llama::Llama(SafetensorsLoader &loader, const LlamaConfig &config) : config(conf
         kvCache.emplace_back(this->config.maxSeqLen, this->config.numKVHeads, this->config.headDim);
     }
 
-    // --- NEW ROBUST GETTER ---
     auto getTensor = [&loader](const std::string& key) -> Tensor* {
         auto it = loader.tensors.find(key);
         if (it == loader.tensors.end()) {
-            std::print("\n[FATAL ERROR] Safetensors missing key {}", key);
-            std::abort();
+            utils::error("Safetensors missing key {}", key);
         }
         return &it->second;
     };
-    // -------------------------
 
     weights.tokenEmbeddings = getTensor("model.embed_tokens.weight");
     weights.finalLayerNormWeight = getTensor("model.norm.weight");
@@ -133,7 +130,7 @@ timing::TimingMetrics Llama::generate(const std::vector<int>& promptTokens,
     int nextToken = sampler(logits);
 
     for (int i = 0; i < maxTokens; i++) {
-        metrics.decodeTime ++;
+        metrics.decodeTokens++;
 
         if (!onTokenGenerated(nextToken)) {
             break;
