@@ -2,7 +2,7 @@
 
 #include <chrono>
 
-Llama::Llama(SafetensorsLoader &loader, const LlamaConfig &config) : config(config) {
+Llama::Llama(SafetensorsLoader &loader, const LlamaConfig &config) : config(config), activations(config) {
     for (int i = 0; i < this->config.numLayers; i++) { // Note: changed from numKVHeads to numLayers
         kvCache.emplace_back(this->config.maxSeqLen, this->config.numKVHeads, this->config.headDim);
     }
@@ -44,67 +44,61 @@ Llama::Llama(SafetensorsLoader &loader, const LlamaConfig &config) : config(conf
 }
 
 
-Tensor Llama::forward(const std::vector<int>& tokens, int startPos) {
-    int token = tokens[0];
+auto Llama::forward(const std::vector<int>& tokens, int startPos) -> const Tensor& {
+    const int seqLen  = tokens.size();
+    const int hiddenDim = config.hiddenSize;
 
-    int hiddenDim = config.hiddenSize;
-    Tensor x({hiddenDim}, DataType::fp32, "x");
-    Tensor xNorm({hiddenDim}, DataType::fp32, "xNorm");
+    assert(seqLen >= 1);
+    assert(startPos + seqLen <= config.maxSeqLen);
 
-    Tensor q({config.numHeads * config.headDim}, DataType::fp32, "q");
-    Tensor k({config.numKVHeads * config.headDim}, DataType::fp32, "k");
-    Tensor v({config.numKVHeads * config.headDim}, DataType::fp32, "v");
-    Tensor attentionOut({hiddenDim}, DataType::fp32, "attentionOut");
+    activations.setSeqLen(seqLen, config);
 
-    Tensor ffnGate({config.intermediateSize}, DataType::fp32, "ffnGate");
-    Tensor ffnUp({config.intermediateSize}, DataType::fp32, "ffnUp");
-    Tensor ffnDown({hiddenDim}, DataType::fp32, "ffnDown");
-
+    // TODO: deal with correct data type more seamlessly
     auto* embedData = static_cast<const uint16_t*>(weights.tokenEmbeddings->data);
-    auto* xData = static_cast<float*>(x.data);
-    for (int i = 0; i < hiddenDim; i++) {
-        xData[i] = bf16Tof32(embedData[token * hiddenDim + i]);
+    auto* xData = static_cast<float*>(activations.x.data);
+    for (int s = 0; s < seqLen; s++) {
+        const int token = tokens[s];
+        for (int i = 0; i < hiddenDim; i++) {
+            xData[s * hiddenDim + i] = bf16Tof32(embedData[token * hiddenDim + i]);
+        }
     }
 
     for (int l = 0; l < config.numLayers; l++) {
         auto& layer = weights.layers[l];
         auto& cache = kvCache[l];
 
-        ops::rmsNorm(xNorm, x, *layer.inputLayerNormWeight, config.rmsNormEps);
+        ops::rmsNorm(activations.xNorm, activations.x, *layer.inputLayerNormWeight, config.rmsNormEps);
 
-        ops::matmul(q, xNorm, *layer.qProjWeight);
-        ops::matmul(k, xNorm, *layer.kProjWeight);
-        ops::matmul(v, xNorm, *layer.vProjWeight);
+        ops::matmul(activations.q, activations.xNorm, *layer.qProjWeight);
+        ops::matmul(activations.k, activations.xNorm, *layer.kProjWeight);
+        ops::matmul(activations.v, activations.xNorm, *layer.vProjWeight);
 
-        ops::applyRope(q, k, startPos, config.ropeTheta);
+        ops::applyRope(activations.q, activations.k, startPos, config.ropeTheta, config.headDim);
 
-        ops::updateCache(cache.kCache, k, startPos);
-        ops::updateCache(cache.vCache, v, startPos);
+        ops::updateCache(cache.kCache, activations.k, startPos);
+        ops::updateCache(cache.vCache, activations.v, startPos);
 
-        ops::attention(attentionOut, q, cache.kCache, cache.vCache, config.numHeads, config.numKVHeads, config.headDim, startPos);
+        ops::attention(activations.attentionOut, activations.q, cache.kCache, cache.vCache, activations.attentionScores, config.numHeads, config.numKVHeads, config.headDim, startPos);
 
-        Tensor oProjOut({hiddenDim}, DataType::fp32, "oProjOut");
-        ops::matmul(oProjOut, attentionOut, *layer.oProjWeight);
-        ops::add(x, x, oProjOut);
+        ops::matmul(activations.oProjOut, activations.attentionOut, *layer.oProjWeight);
+        ops::add(activations.x, activations.x, activations.oProjOut);
 
-        ops::rmsNorm(xNorm, x, *layer.postAttentionLayerNormWeight, config.rmsNormEps);
+        ops::rmsNorm(activations.xNorm, activations.x, *layer.postAttentionLayerNormWeight, config.rmsNormEps);
 
-        ops::matmul(ffnGate, xNorm, *layer.gateProjWeight);
-        ops::matmul(ffnUp, xNorm, *layer.upProjWeight);
+        ops::matmul(activations.ffnGate, activations.xNorm, *layer.gateProjWeight);
+        ops::matmul(activations.ffnUp, activations.xNorm, *layer.upProjWeight);
 
-        ops::silu(ffnGate, ffnGate);
-        ops::mul(ffnGate, ffnGate, ffnUp);
+        ops::silu(activations.ffnGate, activations.ffnGate);
+        ops::mul(activations.ffnGate, activations.ffnGate, activations.ffnUp);
 
-        ops::matmul(ffnDown, ffnGate, *layer.downProjWeight);
-        ops::add(x, x, ffnDown);
+        ops::matmul(activations.ffnDown, activations.ffnGate, *layer.downProjWeight);
+        ops::add(activations.x, activations.x, activations.ffnDown);
     }
 
-    ops::rmsNorm(xNorm, x, *weights.finalLayerNormWeight, config.rmsNormEps);
+    ops::rmsNorm(activations.xNorm, activations.x, *weights.finalLayerNormWeight, config.rmsNormEps);
+    ops::matmul(activations.logits, activations.xNormLastRow, *weights.lmHead);
 
-    Tensor logits({config.vocabSize}, DataType::fp32, "logits");
-    ops::matmul(logits, xNorm, *weights.lmHead);
-
-    return logits;
+    return activations.logits;
 }
 
 timing::TimingMetrics Llama::generate(const std::vector<int>& promptTokens,
@@ -115,19 +109,14 @@ timing::TimingMetrics Llama::generate(const std::vector<int>& promptTokens,
     metrics.prefillTokens = promptTokens.size();
 
     int currentPos = 0;
-    Tensor logits({config.vocabSize}, DataType::fp32, "logits");
     const auto prefillStart = std::chrono::high_resolution_clock::now();
-
-    for (int promptToken : promptTokens) {
-        logits = forward({promptToken}, currentPos);
-        currentPos++;
-    }
-
+    forward(promptTokens, currentPos);
     const auto prefillEnd = std::chrono::high_resolution_clock::now();
     metrics.prefillTime = std::chrono::duration<double, std::milli>(prefillEnd - prefillStart).count();
 
+    currentPos = promptTokens.size();
     auto decodeStart = std::chrono::high_resolution_clock::now();
-    int nextToken = sampler(logits);
+    int nextToken = sampler(activations.logits);
 
     for (int i = 0; i < maxTokens; i++) {
         metrics.decodeTokens++;
@@ -136,8 +125,8 @@ timing::TimingMetrics Llama::generate(const std::vector<int>& promptTokens,
             break;
         }
 
-        logits = forward({nextToken}, currentPos);
-        nextToken = sampler(logits);
+        forward({nextToken}, currentPos);
+        nextToken = sampler(activations.logits);
         currentPos++;
     }
 

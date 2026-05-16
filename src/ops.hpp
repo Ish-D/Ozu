@@ -15,10 +15,10 @@ namespace ops {
     void matmul(Tensor& out, const Tensor& a, const Tensor& b);
     void rmsNorm(Tensor& out, const Tensor& a, const Tensor& weight, float eps);
     void add(Tensor& out, const Tensor& a, const Tensor& b);
-    void applyRope(Tensor& q, Tensor& k, int position, float ropeTheta);
+    void applyRope(Tensor& q, Tensor& k, int position, float ropeTheta, int headDim);
     void silu(Tensor& out, const Tensor& a);
     void mul(Tensor& out, const Tensor& a, const Tensor& b);
     void softmax(Tensor& out, const Tensor& a);
     void updateCache(Tensor& cache, const Tensor& val, int pos);
-    void attention(Tensor& out, const Tensor& q, const Tensor& kCache, const Tensor& vCache, int numQHeads, int numKVHeads, int headDim, int seqPos);
+    void attention(Tensor& out, const Tensor& q, const Tensor& kCache, const Tensor& vCache, Tensor& scoresScratch, int numQHeads, int numKVHeads, int headDim, int startPos);
 }
