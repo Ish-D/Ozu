@@ -30,8 +30,8 @@ public:
     void endSequence()   override {}
     void synchronize()   override {}
 
-    Tensor allocate(std::vector<int> shape, DataType dtype, std::string name) override;
-    Tensor adopt(void* host, std::vector<int> shape, DataType dtype, std::string name) override;
+    std::shared_ptr<Storage> allocateStorage(size_t bytes, const std::string& name) override;
+    std::shared_ptr<Storage> adoptStorage(void* host, size_t bytes, const std::string& name) override;
 
     void embed(Tensor& x, const Tensor& table, const Tensor& tokenIds, EmbedParams) override;
     void attentionBlock(Tensor& x, const AttnWeights&, KVCache&, const AttnBlockParams&) override;

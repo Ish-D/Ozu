@@ -68,37 +68,8 @@ private:
     }
 
 public:
-    // Owning allocation, page-aligned for zero-copy GPU buffer wrapping later.
-    Tensor(std::vector<int> shape, const DataType dataType, std::string name = "buffer", const Device device = Device::CPU)
-        : shape(std::move(shape)), dataType(dataType), device(device), name(std::move(name)) {
-        storage           = std::make_shared<Storage>();
-        storage->where    = device;
-        storage->bytes    = sizeInBytes();
-        storage->ownsHost = true;
-
-        constexpr size_t pageSize = 16384; // Apple silicon page size
-        if (posix_memalign(&storage->host, pageSize, storage->bytes) != 0) {
-            utils::error("Tensor::Tensor() failed to allocate memory for {}", this->name);
-        }
-
-        capacityBytes = storage->bytes;
-        refreshData();
-    }
-
-    // Adopt an external host pointer as its own storage (backend.adopt).
-    Tensor(std::string name, std::vector<int> shape, const DataType dataType, void* dataPtr, const Device device = Device::CPU)
-        : shape(std::move(shape)), dataType(dataType), device(device), name(std::move(name)) {
-        storage           = std::make_shared<Storage>();
-        storage->host     = dataPtr;
-        storage->where    = device;
-        storage->bytes    = sizeInBytes();
-        storage->ownsHost = false;
-
-        capacityBytes = storage->bytes;
-        refreshData();
-    }
-
-    // View into an existing shared storage at a byte offset (safetensors shard, rowView).
+    // View into a shared storage at a byte offset. All tensors are views;
+    // storage is created by a Backend (allocateStorage / adoptStorage).
     Tensor(std::shared_ptr<Storage> storage, const size_t offsetBytes, std::vector<int> shape, const DataType dataType, std::string name)
         : storage(std::move(storage)), offsetBytes(offsetBytes), shape(std::move(shape)), dataType(dataType), name(std::move(name)) {
         device        = this->storage->where;

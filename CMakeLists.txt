@@ -23,3 +23,10 @@ add_executable(Ozu src/main.cpp
                    src/utils.cpp)
 
 target_link_libraries(Ozu PRIVATE nlohmann_json::nlohmann_json)
+
+enable_language(OBJCXX)
+set(CMAKE_OBJCXX_STANDARD 23)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+target_sources(Ozu PRIVATE src/backends/metal_backend.mm)
+set_source_files_properties(src/backends/metal_backend.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(Ozu PRIVATE "-framework Metal" "-framework Foundation")

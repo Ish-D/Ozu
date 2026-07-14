@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "tensor.hpp"
+#include "backend.hpp"
 #include "utils.hpp"
 
 using json = nlohmann::json;
@@ -26,7 +27,7 @@ private:
 public:
     std::unordered_map<std::string, Tensor> tensors;
 
-    bool load(const std::string& modelPath) {
+    bool load(const std::string& modelPath, Backend& backend) {
         fd = open(modelPath.c_str(), O_RDONLY);
         if (fd == -1) {
             utils::error("Safetensorsloader::load failed to open model file {}", modelPath);
@@ -56,11 +57,7 @@ public:
 
         // All tensors in this shard share one Storage over the mmap'd file; each
         // is a view at its byte offset. Enables one MTLBuffer per shard on GPU.
-        auto shard = std::make_shared<Storage>();
-        shard->host     = mappedData;
-        shard->bytes    = fileSize;
-        shard->where    = Device::CPU;
-        shard->ownsHost = false;   // the loader owns the mmap
+        auto shard = backend.adoptStorage(mappedData, fileSize, modelPath);
 
         const size_t dataStart = 8 + headerSize;
         for (auto& element : header.items()) {

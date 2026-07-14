@@ -1,27 +1,42 @@
 #include "cpu_backend.hpp"
 
 #include <cmath>
+#include <cstdlib>
 
 #include "../ops.hpp"
 
 CpuBackend::CpuBackend(const ScratchDims& d)
-    : xNorm     ({d.maxSeqLen, d.hiddenSize},   DataType::fp32, "xNorm"),
-      q         ({d.maxSeqLen, d.qDim},         DataType::fp32, "q"),
-      k         ({d.maxSeqLen, d.kvDim},        DataType::fp32, "k"),
-      v         ({d.maxSeqLen, d.kvDim},        DataType::fp32, "v"),
-      attnOut   ({d.maxSeqLen, d.qDim},         DataType::fp32, "attnOut"),
-      oProjOut  ({d.maxSeqLen, d.hiddenSize},   DataType::fp32, "oProjOut"),
-      ffnGate   ({d.maxSeqLen, d.intermediate}, DataType::fp32, "ffnGate"),
-      ffnUp     ({d.maxSeqLen, d.intermediate}, DataType::fp32, "ffnUp"),
-      ffnDown   ({d.maxSeqLen, d.hiddenSize},   DataType::fp32, "ffnDown"),
-      attnScores({d.maxSeqLen},                 DataType::fp32, "attnScores") {}
+    : xNorm     (allocate({d.maxSeqLen, d.hiddenSize},   DataType::fp32, "xNorm")),
+      q         (allocate({d.maxSeqLen, d.qDim},         DataType::fp32, "q")),
+      k         (allocate({d.maxSeqLen, d.kvDim},        DataType::fp32, "k")),
+      v         (allocate({d.maxSeqLen, d.kvDim},        DataType::fp32, "v")),
+      attnOut   (allocate({d.maxSeqLen, d.qDim},         DataType::fp32, "attnOut")),
+      oProjOut  (allocate({d.maxSeqLen, d.hiddenSize},   DataType::fp32, "oProjOut")),
+      ffnGate   (allocate({d.maxSeqLen, d.intermediate}, DataType::fp32, "ffnGate")),
+      ffnUp     (allocate({d.maxSeqLen, d.intermediate}, DataType::fp32, "ffnUp")),
+      ffnDown   (allocate({d.maxSeqLen, d.hiddenSize},   DataType::fp32, "ffnDown")),
+      attnScores(allocate({d.maxSeqLen},                 DataType::fp32, "attnScores")) {}
 
-Tensor CpuBackend::allocate(std::vector<int> shape, DataType dtype, std::string name) {
-    return Tensor(std::move(shape), dtype, std::move(name), Device::CPU);
+std::shared_ptr<Storage> CpuBackend::allocateStorage(size_t bytes, const std::string& name) {
+    auto s = std::make_shared<Storage>();
+    s->where    = Device::CPU;
+    s->bytes    = bytes;
+    s->ownsHost = true;
+
+    constexpr size_t pageSize = 16384; // Apple silicon page size
+    if (posix_memalign(&s->host, pageSize, bytes) != 0) {
+        utils::error("CpuBackend: failed to allocate {} bytes for {}", bytes, name);
+    }
+    return s;
 }
 
-Tensor CpuBackend::adopt(void* host, std::vector<int> shape, DataType dtype, std::string name) {
-    return Tensor(std::move(name), std::move(shape), dtype, host, Device::CPU);
+std::shared_ptr<Storage> CpuBackend::adoptStorage(void* host, size_t bytes, const std::string&) {
+    auto s = std::make_shared<Storage>();
+    s->host     = host;
+    s->where    = Device::CPU;
+    s->bytes    = bytes;
+    s->ownsHost = false;
+    return s;
 }
 
 void CpuBackend::embed(Tensor& x, const Tensor& table, const Tensor& tokenIds, EmbedParams params) {

@@ -89,9 +89,16 @@ public:
     virtual void endSequence()   = 0;
     virtual void synchronize()   = 0;
 
-    // Storage
-    virtual Tensor allocate(std::vector<int> shape, DataType dtype, std::string name) = 0;
-    virtual Tensor adopt(void* host, std::vector<int> shape, DataType dtype, std::string name) = 0;
+    // Storage: backends own device memory; a Tensor is a view into a Storage.
+    virtual std::shared_ptr<Storage> allocateStorage(size_t bytes, const std::string& name) = 0;
+    virtual std::shared_ptr<Storage> adoptStorage(void* host, size_t bytes, const std::string& name) = 0;
+
+    Tensor allocate(std::vector<int> shape, DataType dtype, std::string name) {
+        size_t elems = 1;
+        for (int d : shape) elems *= static_cast<size_t>(d);
+        auto storage = allocateStorage(elems * dataTypeSize(dtype), name);
+        return Tensor(std::move(storage), 0, std::move(shape), dtype, std::move(name));
+    }
 
     // Blocks
     virtual void embed(Tensor& x, const Tensor& table, const Tensor& tokenIds, EmbedParams) = 0;
