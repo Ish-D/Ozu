@@ -32,8 +32,8 @@ int main(int argc, char* argv[]) {
     Llama model(loader, config, backend);
     Tokenizer tokenizer(tokenizerPath);
 
-    // Non-interactive parity mode: `Ozu <modelDir> <prompt>` generates a fixed
-    // number of greedy tokens and prints their ids, then exits.
+    // Non-interactive mode:
+    // `Ozu <modelDir> <prompt>` generates a fixed number of greedy tokens and prints their ids, then exits.
     if (argc >= 3) {
         std::vector<int> ids;
         auto collect = [&ids](const int token) -> bool {

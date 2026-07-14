@@ -5,17 +5,17 @@
 
 #include "tensor.hpp"
 
-// Compute-backend seam. The model layer calls block ops on a Backend and never
-// touches a device API. Ops record work that writes into `out` tensors; the host
-// may read a result only after synchronize(). See docs/backend-design.md.
+// Model layer calls block ops on a Backend, never touches a device API.
+// Ops record work that writes into `out` tensors; the host
+// may read a result only after synchronize().
 
-struct NormSpec { float eps; float affineOffset; };   // Llama {eps,0}; Gemma-family {eps,1}
+struct NormSpec { float eps; float affineOffset; };
 enum class ActFn    { Silu, GeluTanh };
 enum class RopeType { Default, Proportional };
 
-struct EmbedParams  { float scale = 1.0f; };                             // Gemma: sqrt(hidden)
-struct FinalParams  { NormSpec norm; float logitSoftcap = 0.0f; };       // Gemma: 30
-struct SampleParams { float temperature = 0.0f; int topK = 0; float topP = 0.0f; }; // temp 0 => greedy
+struct EmbedParams  { float scale = 1.0f; };
+struct FinalParams  { NormSpec norm; float logitSoftcap = 0.0f; };
+struct SampleParams { float temperature = 0.0f; int topK = 0; float topP = 0.0f; }; // temp 0 -> greedy
 
 struct AttnWeights {
     Tensor* inputNorm    = nullptr;   // pre-attention norm
@@ -26,7 +26,7 @@ struct AttnWeights {
     Tensor* oProj        = nullptr;
     Tensor* qNorm        = nullptr;   // per-head QK-norm (null on Llama)
     Tensor* kNorm        = nullptr;
-    Tensor* layerScalar  = nullptr;   // role TBD
+    Tensor* layerScalar  = nullptr;
 };
 
 struct AttnBlockParams {
@@ -37,9 +37,9 @@ struct AttnBlockParams {
     NormSpec norm{};
     float    ropeTheta          = 0.0f;
     RopeType ropeType           = RopeType::Default;
-    float    partialRotaryFactor = 1.0f;   // 1.0 => full rotary
-    float    attnScale          = 0.0f;    // 0 => 1/sqrt(headDim)
-    int      windowSize         = 0;       // 0 => global (full causal)
+    float    partialRotaryFactor = 1.0f;   // 1.0 -> full rotary
+    float    attnScale          = 0.0f;    // 0 -> 1/sqrt(headDim)
+    int      windowSize         = 0;       // 0 -> global (full causal)
     bool     kEqV               = false;
 };
 
@@ -58,7 +58,7 @@ struct FFNWeights {
     Tensor* upProj   = nullptr;
     Tensor* downProj = nullptr;
     MoEExperts* experts = nullptr;         // routed path (MoE only)
-    Tensor* preNorm2  = nullptr;           // MoE-path norms (wiring TBD)
+    Tensor* preNorm2  = nullptr;           // MoE-path norms
     Tensor* postNorm1 = nullptr;
     Tensor* postNorm2 = nullptr;
 };
@@ -67,7 +67,7 @@ struct FFNBlockParams {
     NormSpec norm{};
     ActFn act = ActFn::Silu;
     int denseIntermediate = 0;
-    int numExperts        = 0;             // 0 => dense-only
+    int numExperts        = 0;             // 0 -> dense-only
     int topK              = 0;
     int moeIntermediate   = 0;
 };

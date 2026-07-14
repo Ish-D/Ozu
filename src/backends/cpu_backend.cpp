@@ -45,7 +45,7 @@ void CpuBackend::embed(Tensor& x, const Tensor& table, const Tensor& tokenIds, E
 }
 
 void CpuBackend::attentionBlock(Tensor& x, const AttnWeights& w, KVCache& cache, const AttnBlockParams& p) {
-    // Gemma-only features: explicit until implemented against the HF reference.
+    // Gemma-only features
     if (w.qNorm || w.kNorm)              utils::error("CpuBackend: QK-norm not implemented");
     if (w.postAttnNorm)                  utils::error("CpuBackend: sandwich post-attn norm not implemented");
     if (w.layerScalar)                   utils::error("CpuBackend: layer_scalar not implemented");
@@ -126,7 +126,7 @@ void CpuBackend::finalLogits(Tensor& logits, const Tensor& x, const Tensor& fina
 }
 
 void CpuBackend::sample(Tensor& nextTokenId, const Tensor& logits, SampleParams) {
-    // Greedy argmax (temperature-based sampling is a later addition).
+    // Greedy argmax (add temperature-based sampling later).
     const auto* data = static_cast<const float*>(logits.data);
     const int vocab  = logits.shape[0];
 

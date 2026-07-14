@@ -2,7 +2,8 @@
 
 #include <vector>
 #include <string>
-#include <print>
+#include <memory>
+#include <cstdlib>
 
 #include "utils.hpp"
 
@@ -17,44 +18,98 @@ enum class DataType {
     i32
 };
 
+inline size_t dataTypeSize(const DataType dt) {
+    switch (dt) {
+        case DataType::fp32: return 4;
+        case DataType::bf16: return 2;
+        case DataType::i32:  return 4;
+    }
+    utils::error("dataTypeSize(): unsupported dataType");
+}
+
+// Backing allocation, shared by a tensor and all views into it. Holds the
+// host-visible pointer and (later) the device buffer handle used for GPU binding.
+// One Storage backs one CPU allocation or one mmap'd safetensors shard.
+struct Storage {
+    void*  host     = nullptr;
+    void*  device   = nullptr;   // e.g. id<MTLBuffer>; null on CPU
+    size_t bytes    = 0;
+    Device where    = Device::CPU;
+    bool   ownsHost = false;     // free host on destruction (CPU allocations only)
+
+    Storage() = default;
+    Storage(const Storage&)            = delete;
+    Storage& operator=(const Storage&) = delete;
+
+    ~Storage() {
+        if (ownsHost && host) std::free(host);
+        // device buffer release is the GPU backend's responsibility (TODO)
+    }
+};
+
+// Typed, shaped view into a Storage at a byte offset. Views share the Storage;
+// GPU binding is (storage->device, offsetBytes). `data` caches the host pointer.
 struct Tensor {
-    std::string      name;
+    std::shared_ptr<Storage> storage;
+    size_t           offsetBytes = 0;
+    void*            data = nullptr;   // cached: storage->host + offsetBytes
     std::vector<int> shape;
     DataType         dataType;
-    Device           device;
-    void*            data;
+    Device           device = Device::CPU;
+    std::string      name;
 
 private:
-    bool   ownsMemory;
-    size_t allocatedBytes = 0;
+    size_t capacityBytes = 0;          // bytes available in storage from offsetBytes
 
-public:
-    Tensor(std::string name, std::vector<int> shape, const DataType dataType, void* dataPtr, const Device device = Device::CPU): name(std::move(name)),
-                                                                                                                                 shape(std::move(shape)),
-                                                                                                                                 dataType(dataType),
-                                                                                                                                 device(device),
-                                                                                                                                 data(dataPtr),
-                                                                                                                                 ownsMemory(false) {
-        allocatedBytes = sizeInBytes();
+    void refreshData() {
+        data = (storage && storage->host)
+                   ? static_cast<char*>(storage->host) + offsetBytes
+                   : nullptr;
     }
 
-    Tensor(std::vector<int> shape, const DataType dataType, std::string name = "buffer", const Device device = Device::CPU): name(std::move(name)),
-                                                                                                                             shape(std::move(shape)),
-                                                                                                                             dataType(dataType),
-                                                                                                                             device(device),
-                                                                                                                             ownsMemory(true) {
-        allocatedBytes = sizeInBytes();
-        size_t pageSize = 16384; // Apple silicon page size
+public:
+    // Owning allocation, page-aligned for zero-copy GPU buffer wrapping later.
+    Tensor(std::vector<int> shape, const DataType dataType, std::string name = "buffer", const Device device = Device::CPU)
+        : shape(std::move(shape)), dataType(dataType), device(device), name(std::move(name)) {
+        storage           = std::make_shared<Storage>();
+        storage->where    = device;
+        storage->bytes    = sizeInBytes();
+        storage->ownsHost = true;
 
-        if (posix_memalign(&data, pageSize, allocatedBytes) != 0) {
-            utils::error("Tensor::Tensor() Failed to allocate memory for {}", this->name);
+        constexpr size_t pageSize = 16384; // Apple silicon page size
+        if (posix_memalign(&storage->host, pageSize, storage->bytes) != 0) {
+            utils::error("Tensor::Tensor() failed to allocate memory for {}", this->name);
         }
+
+        capacityBytes = storage->bytes;
+        refreshData();
+    }
+
+    // Adopt an external host pointer as its own storage (backend.adopt).
+    Tensor(std::string name, std::vector<int> shape, const DataType dataType, void* dataPtr, const Device device = Device::CPU)
+        : shape(std::move(shape)), dataType(dataType), device(device), name(std::move(name)) {
+        storage           = std::make_shared<Storage>();
+        storage->host     = dataPtr;
+        storage->where    = device;
+        storage->bytes    = sizeInBytes();
+        storage->ownsHost = false;
+
+        capacityBytes = storage->bytes;
+        refreshData();
+    }
+
+    // View into an existing shared storage at a byte offset (safetensors shard, rowView).
+    Tensor(std::shared_ptr<Storage> storage, const size_t offsetBytes, std::vector<int> shape, const DataType dataType, std::string name)
+        : storage(std::move(storage)), offsetBytes(offsetBytes), shape(std::move(shape)), dataType(dataType), name(std::move(name)) {
+        device        = this->storage->where;
+        capacityBytes = this->storage->bytes - offsetBytes;
+        refreshData();
     }
 
     void reshape(std::vector<int> newShape) {
         shape = std::move(newShape);
 
-        if (sizeInBytes() > allocatedBytes) {
+        if (sizeInBytes() > capacityBytes) {
             utils::error("Tensor()::reshape exceeds allocated capacity for {}", this->name);
         }
     }
@@ -67,65 +122,17 @@ public:
         int rowElems = 1;
         for (size_t i = 1; i < src.shape.size(); ++i) rowElems *= src.shape[i];
 
-        size_t offsetBytes = static_cast<size_t>(rowIdx) * rowElems * src.elementSize();
+        size_t offset = src.offsetBytes + static_cast<size_t>(rowIdx) * rowElems * src.elementSize();
         std::vector<int> newShape(src.shape.begin() + 1, src.shape.end());
 
-        return Tensor(src.name + "_row",
-                      std::move(newShape),
-                      src.dataType, static_cast<char*>(src.data) + offsetBytes,
-                      src.device);
+        return Tensor(src.storage, offset, std::move(newShape), src.dataType, src.name + "_row");
     }
 
-    void releaseOwnedMemory() {
-        if (!ownsMemory || data == nullptr) return;
-
-        switch (device) {
-            case Device::CPU: free(data); break;
-            case Device::GPU: break; // TODO
-        }
-
-        data = nullptr;
-    }
-
-    ~Tensor() {
-        releaseOwnedMemory();
-    }
-
-    // Prevent copying of tensors
-    Tensor(const Tensor&) = delete;
+    // Move-only: storage ownership transfers, views release via shared_ptr refcount.
+    Tensor(const Tensor&)            = delete;
     Tensor& operator=(const Tensor&) = delete;
-
-    // Allow moving of tensors
-    Tensor(Tensor&& other) noexcept : name(std::move(other.name)),
-                                      shape(std::move(other.shape)),
-                                      dataType(other.dataType),
-                                      device(other.device),
-                                      data(other.data),
-                                      ownsMemory(other.ownsMemory),
-                                      allocatedBytes(other.allocatedBytes) {
-        other.data = nullptr;
-        other.ownsMemory = false;
-    }
-
-    Tensor& operator=(Tensor&& other) noexcept {
-        if (this != &other) {
-            releaseOwnedMemory();
-
-            name           = std::move(other.name);
-            shape          = std::move(other.shape);
-            dataType       = other.dataType;
-            device         = other.device;
-            data           = other.data;
-            ownsMemory     = other.ownsMemory;
-            allocatedBytes = other.allocatedBytes;
-
-            other.data           = nullptr;
-            other.ownsMemory     = false;
-            other.allocatedBytes = 0;
-        }
-
-        return *this;
-    }
+    Tensor(Tensor&&) noexcept            = default;
+    Tensor& operator=(Tensor&&) noexcept = default;
 
     [[nodiscard]] size_t numElements() const {
         if (shape.empty()) {
@@ -141,14 +148,7 @@ public:
     }
 
     [[nodiscard]] size_t elementSize() const {
-        switch (dataType) {
-            case DataType::fp32: return 4;
-            case DataType::bf16: return 2;
-            case DataType::i32:  return 4;
-            default: {
-                utils::error("Tensor::elementSize(): unsupported dataType for tensor {}", this->name);
-            }
-        }
+        return dataTypeSize(dataType);
     }
 
     [[nodiscard]] size_t sizeInBytes() const {

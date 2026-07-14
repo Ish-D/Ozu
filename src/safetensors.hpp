@@ -54,7 +54,15 @@ public:
         std::string jsonStr(mappedData + 8, headerSize);
         json header = json::parse(jsonStr);
 
-        char* rawDataStart = mappedData + 8 + headerSize;
+        // All tensors in this shard share one Storage over the mmap'd file; each
+        // is a view at its byte offset. Enables one MTLBuffer per shard on GPU.
+        auto shard = std::make_shared<Storage>();
+        shard->host     = mappedData;
+        shard->bytes    = fileSize;
+        shard->where    = Device::CPU;
+        shard->ownsHost = false;   // the loader owns the mmap
+
+        const size_t dataStart = 8 + headerSize;
         for (auto& element : header.items()) {
             std::string tensorName = element.key();
 
@@ -75,9 +83,7 @@ public:
             size_t endOffset = tensorInfo["data_offsets"][1];
             size_t fileSizeInBytes = endOffset - startOffset;
 
-            void* dataPtr = static_cast<void*>(rawDataStart + startOffset);
-
-            Tensor tensor(tensorName, std::move(shape), dataType, dataPtr);
+            Tensor tensor(shard, dataStart + startOffset, std::move(shape), dataType, tensorName);
             if (tensor.sizeInBytes() != fileSizeInBytes) {
                 utils::error("Shape/byte mismatch for tensor {}. File expects {}, Computed {}.", tensorName, fileSizeInBytes, tensor.sizeInBytes());
             }

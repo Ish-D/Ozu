@@ -11,7 +11,7 @@ struct ScratchDims {
     int intermediate;    // max dense FFN width
 };
 
-// Reference CPU backend. Blocks are thin orchestration over the ops:: kernels;
+// CPU backend. Blocks are thin orchestration over the ops:: kernels;
 // the backend owns all transient scratch. Only the Llama path is implemented;
 // Gemma-only features error out explicitly (see docs/backend-design.md §13).
 class CpuBackend : public Backend {
