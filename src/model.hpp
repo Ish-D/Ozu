@@ -2,6 +2,7 @@
 
 #include "tensor.hpp"
 #include "utils.hpp"
+#include "backend.hpp"
 #include <functional>
 
 class LanguageModel {
@@ -10,7 +11,7 @@ public:
 
     virtual auto forward(const std::vector<int>& tokens, int startPos) -> const Tensor& = 0;
     virtual timing::TimingMetrics generate(const std::vector<int>& promptTokens,
-                                                 int maxTokens,
-                                                 const std::function<int(const Tensor&)>& sampler,
-                                                 const std::function<bool(int)>& onTokenGenerated) = 0;
+                                           int maxTokens,
+                                           SampleParams sampleParams,
+                                           const std::function<bool(int)>& onTokenGenerated) = 0;
 };

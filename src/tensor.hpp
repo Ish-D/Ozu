@@ -13,7 +13,8 @@ enum class Device {
 
 enum class DataType {
     fp32,
-    bf16
+    bf16,
+    i32
 };
 
 struct Tensor {
@@ -143,6 +144,7 @@ public:
         switch (dataType) {
             case DataType::fp32: return 4;
             case DataType::bf16: return 2;
+            case DataType::i32:  return 4;
             default: {
                 utils::error("Tensor::elementSize(): unsupported dataType for tensor {}", this->name);
             }

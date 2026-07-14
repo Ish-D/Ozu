@@ -18,6 +18,7 @@ add_executable(Ozu src/main.cpp
                    src/ops.cpp
                    src/model.cpp
                    src/models/llama.cpp
+                   src/backends/cpu_backend.cpp
                    src/tokenizer.cpp
                    src/utils.cpp)
 

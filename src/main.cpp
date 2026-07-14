@@ -2,29 +2,13 @@
 
 #include "tokenizer.hpp"
 #include "models/llama.hpp"
+#include "backends/cpu_backend.hpp"
 #include "utils.hpp"
-
-int greedySample(const Tensor& logits) {
-    auto* data = static_cast<float*>(logits.data);
-    int vocabSize = logits.shape[0];
-
-    int bestToken = 0;
-    float maxLogit = data[0];
-
-    for (int i = 1; i < vocabSize; ++i) {
-        if (data[i] > maxLogit) {
-            maxLogit = data[i];
-            bestToken = i;
-        }
-    }
-
-    return bestToken;
-}
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::print("Error: Missing model directory.\n");
-        std::print("Usage: {}/path/to/huggingface/model_folder\n", argv[0]);
+        std::print("Usage: {} /path/to/huggingface/model_folder [prompt]\n", argv[0]);
         return 1;
     }
 
@@ -35,12 +19,34 @@ int main(int argc, char* argv[]) {
 
     LlamaConfig config = LlamaConfig::load(configPath);
     SafetensorsLoader loader;
-
     loader.load(modelPath);
 
-    Llama model(loader, config);
+    ScratchDims dims{
+        config.maxSeqLen,
+        config.hiddenSize,
+        config.numHeads * config.headDim,
+        config.numKVHeads * config.headDim,
+        config.intermediateSize};
+    CpuBackend backend(dims);
 
+    Llama model(loader, config, backend);
     Tokenizer tokenizer(tokenizerPath);
+
+    // Non-interactive parity mode: `Ozu <modelDir> <prompt>` generates a fixed
+    // number of greedy tokens and prints their ids, then exits.
+    if (argc >= 3) {
+        std::vector<int> ids;
+        auto collect = [&ids](const int token) -> bool {
+            if (token == 128009) return false;
+            ids.push_back(token);
+            return true;
+        };
+        std::vector<int> promptTokens = tokenizer.encode(argv[2]);
+        model.generate(promptTokens, 16, SampleParams{}, collect);
+        for (const int id : ids) std::print("{} ", id);
+        std::print("\n");
+        return 0;
+    }
 
     auto streamOutput = [&tokenizer](const int token) -> bool {
         if (token == 128009) return false;
@@ -58,7 +64,7 @@ int main(int argc, char* argv[]) {
         if (prompt.empty()) continue;
         std::vector<int> promptTokens = tokenizer.encode(prompt);
         std::print("Ozu: ");
-        timing::TimingMetrics metrics = model.generate(promptTokens, 20, greedySample, streamOutput);
+        timing::TimingMetrics metrics = model.generate(promptTokens, 20, SampleParams{}, streamOutput);
         metrics.print();
     }
 

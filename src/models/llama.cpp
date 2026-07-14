@@ -1,10 +1,23 @@
 #include "llama.hpp"
 
+#include <cassert>
 #include <chrono>
 
-Llama::Llama(SafetensorsLoader &loader, const LlamaConfig &config) : config(config), activations(config) {
-    for (int i = 0; i < this->config.numLayers; i++) { // Note: changed from numKVHeads to numLayers
-        kvCache.emplace_back(this->config.maxSeqLen, this->config.numKVHeads, this->config.headDim);
+Llama::Llama(SafetensorsLoader& loader, const LlamaConfig& config, Backend& backend)
+    : backend(backend),
+      config(config),
+      x         (backend.allocate({config.maxSeqLen, config.hiddenSize}, DataType::fp32, "x")),
+      logits    (backend.allocate({config.vocabSize}, DataType::fp32, "logits")),
+      idsScratch(backend.allocate({config.maxSeqLen}, DataType::i32, "idsScratch")),
+      nextTokenId(backend.allocate({1}, DataType::i32, "nextTokenId")) {
+
+    const int kvDim = config.numKVHeads * config.headDim;
+    for (int i = 0; i < config.numLayers; i++) {
+        kvCache.push_back(KVCache{
+            backend.allocate({config.maxSeqLen, kvDim}, DataType::fp32, "kCache"),
+            backend.allocate({config.maxSeqLen, kvDim}, DataType::fp32, "vCache"),
+            config.maxSeqLen,
+            false});
     }
 
     auto getTensor = [&loader](const std::string& key) -> Tensor* {
@@ -15,122 +28,97 @@ Llama::Llama(SafetensorsLoader &loader, const LlamaConfig &config) : config(conf
         return &it->second;
     };
 
-    weights.tokenEmbeddings = getTensor("model.embed_tokens.weight");
-    weights.finalLayerNormWeight = getTensor("model.norm.weight");
+    tokenEmbeddings = getTensor("model.embed_tokens.weight");
+    finalNormWeight = getTensor("model.norm.weight");
     auto it = loader.tensors.find("lm_head.weight");
-    if (it != loader.tensors.end()) {
-        weights.lmHead = &it->second;
-    } else {
-        weights.lmHead = weights.tokenEmbeddings;
-    }
+    lmHead = (it != loader.tensors.end()) ? &it->second : tokenEmbeddings;
 
-    weights.layers.resize(this->config.numLayers);
-    for (int i = 0; i < this->config.numLayers; i++) {
+    attnWeights.resize(config.numLayers);
+    ffnWeights.resize(config.numLayers);
+    for (int i = 0; i < config.numLayers; i++) {
         std::string prefix = "model.layers." + std::to_string(i) + ".";
 
-        weights.layers[i].inputLayerNormWeight = getTensor(prefix + "input_layernorm.weight");
+        attnWeights[i].inputNorm = getTensor(prefix + "input_layernorm.weight");
+        attnWeights[i].qProj     = getTensor(prefix + "self_attn.q_proj.weight");
+        attnWeights[i].kProj     = getTensor(prefix + "self_attn.k_proj.weight");
+        attnWeights[i].vProj     = getTensor(prefix + "self_attn.v_proj.weight");
+        attnWeights[i].oProj     = getTensor(prefix + "self_attn.o_proj.weight");
 
-        weights.layers[i].qProjWeight = getTensor(prefix + "self_attn.q_proj.weight");
-        weights.layers[i].kProjWeight = getTensor(prefix + "self_attn.k_proj.weight");
-        weights.layers[i].vProjWeight = getTensor(prefix + "self_attn.v_proj.weight");
-        weights.layers[i].oProjWeight = getTensor(prefix + "self_attn.o_proj.weight");
-
-        weights.layers[i].postAttentionLayerNormWeight = getTensor(prefix + "post_attention_layernorm.weight");
-
-        weights.layers[i].gateProjWeight = getTensor(prefix + "mlp.gate_proj.weight");
-        weights.layers[i].upProjWeight = getTensor(prefix + "mlp.up_proj.weight");
-        weights.layers[i].downProjWeight = getTensor(prefix + "mlp.down_proj.weight");
+        // Llama applies post_attention_layernorm as the pre-FFN norm (not a sandwich).
+        ffnWeights[i].preNorm  = getTensor(prefix + "post_attention_layernorm.weight");
+        ffnWeights[i].gateProj = getTensor(prefix + "mlp.gate_proj.weight");
+        ffnWeights[i].upProj   = getTensor(prefix + "mlp.up_proj.weight");
+        ffnWeights[i].downProj = getTensor(prefix + "mlp.down_proj.weight");
     }
+
+    attnParams  = {config.numHeads, config.numKVHeads, config.headDim, 0,
+                   {config.rmsNormEps, 0.0f}, config.ropeTheta, RopeType::Default, 1.0f, 0.0f, 0, false};
+    ffnParams   = {{config.rmsNormEps, 0.0f}, ActFn::Silu, config.intermediateSize, 0, 0, 0};
+    finalParams = {{config.rmsNormEps, 0.0f}, 0.0f};
+    embedParams = {1.0f};
 }
 
-
 auto Llama::forward(const std::vector<int>& tokens, int startPos) -> const Tensor& {
-    const int seqLen  = tokens.size();
-    const int hiddenDim = config.hiddenSize;
-
+    const int seqLen = tokens.size();
     assert(seqLen >= 1);
     assert(startPos + seqLen <= config.maxSeqLen);
 
-    activations.setSeqLen(seqLen, config);
+    idsScratch.reshape({seqLen});
+    auto* ids = static_cast<int32_t*>(idsScratch.data);
+    for (int s = 0; s < seqLen; s++) ids[s] = tokens[s];
 
-    // TODO: deal with correct data type more seamlessly
-    auto* embedData = static_cast<const uint16_t*>(weights.tokenEmbeddings->data);
-    auto* xData = static_cast<float*>(activations.x.data);
-    for (int s = 0; s < seqLen; s++) {
-        const int token = tokens[s];
-        for (int i = 0; i < hiddenDim; i++) {
-            xData[s * hiddenDim + i] = bf16Tof32(embedData[token * hiddenDim + i]);
-        }
-    }
+    backend.embed(x, *tokenEmbeddings, idsScratch, embedParams);
 
     for (int l = 0; l < config.numLayers; l++) {
-        auto& layer = weights.layers[l];
-        auto& cache = kvCache[l];
-
-        ops::rmsNorm(activations.xNorm, activations.x, *layer.inputLayerNormWeight, config.rmsNormEps);
-
-        ops::matmul(activations.q, activations.xNorm, *layer.qProjWeight);
-        ops::matmul(activations.k, activations.xNorm, *layer.kProjWeight);
-        ops::matmul(activations.v, activations.xNorm, *layer.vProjWeight);
-
-        ops::applyRope(activations.q, activations.k, startPos, config.ropeTheta, config.headDim);
-
-        ops::updateCache(cache.kCache, activations.k, startPos);
-        ops::updateCache(cache.vCache, activations.v, startPos);
-
-        ops::attention(activations.attentionOut, activations.q, cache.kCache, cache.vCache, activations.attentionScores, config.numHeads, config.numKVHeads, config.headDim, startPos);
-
-        ops::matmul(activations.oProjOut, activations.attentionOut, *layer.oProjWeight);
-        ops::add(activations.x, activations.x, activations.oProjOut);
-
-        ops::rmsNorm(activations.xNorm, activations.x, *layer.postAttentionLayerNormWeight, config.rmsNormEps);
-
-        ops::matmul(activations.ffnGate, activations.xNorm, *layer.gateProjWeight);
-        ops::matmul(activations.ffnUp, activations.xNorm, *layer.upProjWeight);
-
-        ops::silu(activations.ffnGate, activations.ffnGate);
-        ops::mul(activations.ffnGate, activations.ffnGate, activations.ffnUp);
-
-        ops::matmul(activations.ffnDown, activations.ffnGate, *layer.downProjWeight);
-        ops::add(activations.x, activations.x, activations.ffnDown);
+        attnParams.startPos = startPos;
+        backend.attentionBlock(x, attnWeights[l], kvCache[l], attnParams);
+        backend.ffnBlock(x, ffnWeights[l], ffnParams);
     }
 
-    ops::rmsNorm(activations.xNorm, activations.x, *weights.finalLayerNormWeight, config.rmsNormEps);
-    ops::matmul(activations.logits, activations.xNormLastRow, *weights.lmHead);
-
-    return activations.logits;
+    backend.finalLogits(logits, x, *finalNormWeight, *lmHead, finalParams);
+    return logits;
 }
 
 timing::TimingMetrics Llama::generate(const std::vector<int>& promptTokens,
-                                                 int maxTokens,
-                                                 const std::function<int(const Tensor&)>& sampler,
-                                                 const std::function<bool(int)>& onTokenGenerated) {
+                                      int maxTokens,
+                                      SampleParams sampleParams,
+                                      const std::function<bool(int)>& onTokenGenerated) {
     timing::TimingMetrics metrics;
     metrics.prefillTokens = promptTokens.size();
 
+    const auto readNext = [this]() -> int {
+        return static_cast<const int32_t*>(nextTokenId.data)[0];
+    };
+
     int currentPos = 0;
     const auto prefillStart = std::chrono::high_resolution_clock::now();
+    backend.beginSequence();
     forward(promptTokens, currentPos);
+    backend.sample(nextTokenId, logits, sampleParams);
+    backend.endSequence();
+    backend.synchronize();
     const auto prefillEnd = std::chrono::high_resolution_clock::now();
     metrics.prefillTime = std::chrono::duration<double, std::milli>(prefillEnd - prefillStart).count();
 
     currentPos = promptTokens.size();
-    auto decodeStart = std::chrono::high_resolution_clock::now();
-    int nextToken = sampler(activations.logits);
+    int nextToken = readNext();
 
+    const auto decodeStart = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < maxTokens; i++) {
         metrics.decodeTokens++;
 
-        if (!onTokenGenerated(nextToken)) {
-            break;
-        }
+        if (!onTokenGenerated(nextToken)) break;
 
+        backend.beginSequence();
         forward({nextToken}, currentPos);
-        nextToken = sampler(activations.logits);
+        backend.sample(nextTokenId, logits, sampleParams);
+        backend.endSequence();
+        backend.synchronize();
+
+        nextToken = readNext();
         currentPos++;
     }
-
-    auto decodeEnd = std::chrono::high_resolution_clock::now();
+    const auto decodeEnd = std::chrono::high_resolution_clock::now();
     metrics.decodeTime = std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
 
     return metrics;

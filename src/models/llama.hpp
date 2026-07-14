@@ -4,8 +4,8 @@
 #include <fstream>
 
 #include "../model.hpp"
+#include "../backend.hpp"
 #include "../safetensors.hpp"
-#include "../ops.hpp"
 
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
@@ -49,93 +49,35 @@ struct LlamaConfig {
     }
 };
 
-struct LayerWeights {
-    Tensor* inputLayerNormWeight;
-    Tensor* postAttentionLayerNormWeight;
-    Tensor* qProjWeight;
-    Tensor* kProjWeight;
-    Tensor* vProjWeight;
-    Tensor* oProjWeight;
-    Tensor* gateProjWeight;
-    Tensor* upProjWeight;
-    Tensor* downProjWeight;
-};
-
-struct LlamaWeights {
-    Tensor* tokenEmbeddings;
-    std::vector<LayerWeights> layers;
-    Tensor* finalLayerNormWeight;
-    Tensor* lmHead;
-};
-
-struct LlamaActivations {
-    Tensor x;
-    Tensor xNorm;
-    Tensor q;
-    Tensor k;
-    Tensor v;
-    Tensor attentionOut;
-    Tensor oProjOut;
-    Tensor ffnGate;
-    Tensor ffnUp;
-    Tensor ffnDown;
-    Tensor logits;
-    Tensor xNormLastRow;
-    Tensor attentionScores;
-
-    explicit LlamaActivations(const LlamaConfig& config) : x            ({config.maxSeqLen, config.hiddenSize},                  DataType::fp32, "x"),
-                                                           xNorm        ({config.maxSeqLen, config.hiddenSize},                  DataType::fp32, "xNorm"),
-                                                           q            ({config.maxSeqLen, config.numHeads * config.headDim},   DataType::fp32, "q"),
-                                                           k            ({config.maxSeqLen, config.numKVHeads * config.headDim}, DataType::fp32, "k"),
-                                                           v            ({config.maxSeqLen, config.numKVHeads * config.headDim}, DataType::fp32, "v"),
-                                                           attentionOut ({config.maxSeqLen, config.hiddenSize},                  DataType::fp32, "attentionOut"),
-                                                           oProjOut     ({config.maxSeqLen, config.hiddenSize},                  DataType::fp32, "oProjOut"),
-                                                           ffnGate      ({config.maxSeqLen, config.intermediateSize},            DataType::fp32, "ffnGate"),
-                                                           ffnUp        ({config.maxSeqLen, config.intermediateSize},            DataType::fp32, "ffnUp"),
-                                                           ffnDown      ({config.maxSeqLen, config.hiddenSize},                  DataType::fp32, "ffnDown"),
-                                                           logits       ({config.vocabSize},                   DataType::fp32, "logits"),
-                                                           xNormLastRow ("xNormLastRow", {config.hiddenSize}, DataType::fp32, xNorm.data),
-                                                           attentionScores({config.maxSeqLen}, DataType::fp32, "attentionScores") {}
-
-
-    void setSeqLen(int seqLen, const LlamaConfig& config) {
-        x.reshape(           {seqLen, config.hiddenSize});
-        xNorm.reshape(       {seqLen, config.hiddenSize});
-        q.reshape(           {seqLen, config.numHeads * config.headDim});
-        k.reshape(           {seqLen, config.numKVHeads * config.headDim});
-        v.reshape(           {seqLen, config.numKVHeads * config.headDim});
-        attentionOut.reshape({seqLen, config.hiddenSize});
-        oProjOut.reshape(    {seqLen, config.hiddenSize});
-        ffnGate.reshape(     {seqLen, config.intermediateSize});
-        ffnUp.reshape(       {seqLen, config.intermediateSize});
-        ffnDown.reshape(     {seqLen, config.hiddenSize});
-
-        size_t rowBytes = static_cast<size_t>(config.hiddenSize) * xNorm.elementSize();
-        xNormLastRow.data = static_cast<char*>(xNorm.data) + (seqLen - 1) * rowBytes;
-    }
-};
-
-struct KVCacheLayer {
-    Tensor kCache;
-    Tensor vCache;
-
-    KVCacheLayer(int maxSeqLen, int numKVHeads, int headDim) : kCache({maxSeqLen, numKVHeads * headDim}, DataType::fp32, "k_cache"),
-                                                               vCache({maxSeqLen, numKVHeads * headDim}, DataType::fp32, "v_cache") {}
-};
-
 class Llama : public LanguageModel {
 private:
+    Backend& backend;
     LlamaConfig config;
-    LlamaWeights weights;
-    LlamaActivations activations;
-    std::vector<KVCacheLayer> kvCache;
+
+    Tensor* tokenEmbeddings = nullptr;
+    Tensor* finalNormWeight = nullptr;
+    Tensor* lmHead          = nullptr;
+    std::vector<AttnWeights> attnWeights;
+    std::vector<FFNWeights>  ffnWeights;
+    std::vector<KVCache>     kvCache;
+
+    // Model-owned state (backend owns transient scratch).
+    Tensor x;
+    Tensor logits;
+    Tensor idsScratch;   // i32 token ids handed to embed()
+    Tensor nextTokenId;  // i32 [1], written by sample()
+
+    AttnBlockParams attnParams;
+    FFNBlockParams  ffnParams;
+    FinalParams     finalParams;
+    EmbedParams     embedParams;
 
 public:
-    Llama(SafetensorsLoader& loader, const LlamaConfig &config);
+    Llama(SafetensorsLoader& loader, const LlamaConfig& config, Backend& backend);
 
     auto forward(const std::vector<int>& tokens, int startPos) -> const Tensor& override;
     timing::TimingMetrics generate(const std::vector<int>& promptTokens,
-                                                 int maxTokens,
-                                                 const std::function<int(const Tensor&)>& sampler,
-                                                 const std::function<bool(int)>& onTokenGenerated) override;
+                                   int maxTokens,
+                                   SampleParams sampleParams,
+                                   const std::function<bool(int)>& onTokenGenerated) override;
 };
